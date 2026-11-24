@@ -20,8 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         size:
-          - { name: 1k, products: 1000, orders: 1000, customers: 500 }
-          - { name: 10k, products: 10000, orders: 10000, customers: 5000 }
+          # Figures of the report: run 45423895830 (four sizes). This run profiles the two largest again.
           - { name: 100k, products: 100000, orders: 100000, customers: 50000 }
           - { name: 10k-200k-orders, products: 10000, orders: 200000, customers: 50000 }
     env:
@@ -166,7 +165,7 @@ jobs:
           mysql -h127.0.0.1 -uroot -proot -e "TRUNCATE mysql.general_log; TRUNCATE mysql.slow_log; SET GLOBAL log_output = 'TABLE'; SET GLOBAL long_query_time = 0.05; SET GLOBAL slow_query_log = 1; SET GLOBAL general_log = 1;"
           php bin/console thelia:test:volume:measure --base-url="$ORIGIN" --runs=1 --skip-jobs --output="$RESULTS/profile.json" --no-ansi > "$RESULTS/profile.txt" 2>&1 || true
           mysql -h127.0.0.1 -uroot -proot -e "SET GLOBAL general_log = 0; SET GLOBAL slow_query_log = 0;"
-          mysql -h127.0.0.1 -uroot -proot -N -B -e "SELECT TIME_TO_SEC(query_time) + MICROSECOND(query_time) / 1000000, rows_examined, CONVERT(sql_text USING utf8mb4) FROM mysql.slow_log WHERE sql_text NOT LIKE 'SHOW GLOBAL STATUS%'" > "$RUNNER_TEMP/slow.tsv"
+          mysql -h127.0.0.1 -uroot -proot -N -B -e "SELECT thread_id, TIME_TO_SEC(query_time) + MICROSECOND(query_time) / 1000000, rows_examined, CONVERT(sql_text USING utf8mb4) FROM mysql.slow_log WHERE sql_text NOT LIKE 'SHOW GLOBAL STATUS%'" > "$RUNNER_TEMP/slow.tsv"
           mysql -h127.0.0.1 -uroot -proot -N -B -e "SELECT thread_id, command_type, CONVERT(argument USING utf8mb4) FROM mysql.general_log" > "$RUNNER_TEMP/general.tsv"
           python3 .github/volume/profile.py "$RUNNER_TEMP/general.tsv" "$RESULTS/profile.json" "$RESULTS/statements.md" "$RUNNER_TEMP/slow.tsv"
           cat "$RESULTS/statements.md" >> "$GITHUB_STEP_SUMMARY"

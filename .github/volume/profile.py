@@ -35,14 +35,18 @@ def main(log_file: str, campaign_file: str, output_file: str, slow_file: str = "
     cuts = [index for index, (thread, kind, text) in enumerate(rows) if thread == reader and text.strip() == READING]
 
     pages = json.load(open(campaign_file, encoding="utf-8"))["pages"]
-    statements_of_page = {}
+    threads_of_page = {}
     lines = ["# Statements per page", ""]
     for position, page in enumerate(pages):
         pair = 3 + 2 * position + 1
         start, end = cuts[2 * pair], cuts[2 * pair + 1]
+        # The connections of the warm-up call and of the measured call both belong to the page.
+        warm_start, warm_end = cuts[2 * (pair - 1)], cuts[2 * (pair - 1) + 1]
+        threads_of_page[page["name"]] = {
+            thread for thread, kind, text in rows[warm_start + 1:warm_end] + rows[start + 1:end] if thread != reader
+        }
         statements = [text for thread, kind, text in rows[start + 1:end] if thread != reader and kind in ("Query", "Execute")]
         counted = Counter(normalise(text.replace("\\n", " ")) for text in statements)
-        statements_of_page[page["name"]] = set(counted)
         lines.append(f"## {page['name']} ({len(statements)} statements logged, {page['steady']} counted)")
         lines.append("")
         lines.append("| Times | Statement |")
@@ -52,22 +56,23 @@ def main(log_file: str, campaign_file: str, output_file: str, slow_file: str = "
         lines.append("")
 
     if slow_file:
-        # Slow log rows: seconds, rows examined, statement. Grouped by normalised statement, slowest first.
+        # Slow log rows: thread id, seconds, rows examined, statement. Grouped by normalised statement, slowest first.
         slow = {}
         with open(slow_file, encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                parts = line.rstrip("\n").split("\t", 2)
-                if len(parts) != 3:
+                parts = line.rstrip("\n").split("\t", 3)
+                if len(parts) != 4:
                     continue
-                seconds, examined, text = float(parts[0]), int(parts[1]), parts[2].replace("\\n", " ")
+                thread, seconds, examined, text = parts[0], float(parts[1]), int(parts[2]), parts[3].replace("\\n", " ")
                 key = normalise(text)
-                entry = slow.setdefault(key, {"times": 0, "seconds": 0.0, "examined": 0})
+                entry = slow.setdefault(key, {"times": 0, "seconds": 0.0, "examined": 0, "pages": set()})
+                entry["pages"].update(name for name, threads in threads_of_page.items() if thread in threads)
                 entry["times"] += 1
                 entry["seconds"] = max(entry["seconds"], seconds)
                 entry["examined"] = max(entry["examined"], examined)
         head = ["# Slow statements", "", "| Slowest (s) | Rows examined | Times | Pages | Statement |", "|---:|---:|---:|---|---|"]
         for key, entry in sorted(slow.items(), key=lambda item: -item[1]["seconds"])[:25]:
-            where = ", ".join(name for name, seen in statements_of_page.items() if key in seen) or "-"
+            where = ", ".join(sorted(entry["pages"])) or "-"
             head.append(f"| {entry['seconds']:.3f} | {entry['examined']} | {entry['times']} | {where} | `{key[:600].replace('|', '/')}` |")
         lines = head + [""] + lines
 
