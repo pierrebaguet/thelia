@@ -23,7 +23,7 @@ def normalise(statement: str) -> str:
     return re.sub(r"\s+", " ", statement).strip()
 
 
-def main(log_file: str, campaign_file: str, output_file: str) -> None:
+def main(log_file: str, campaign_file: str, output_file: str, slow_file: str = "") -> None:
     rows = []
     with open(log_file, encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -35,12 +35,14 @@ def main(log_file: str, campaign_file: str, output_file: str) -> None:
     cuts = [index for index, (thread, kind, text) in enumerate(rows) if thread == reader and text.strip() == READING]
 
     pages = json.load(open(campaign_file, encoding="utf-8"))["pages"]
+    statements_of_page = {}
     lines = ["# Statements per page", ""]
     for position, page in enumerate(pages):
         pair = 3 + 2 * position + 1
         start, end = cuts[2 * pair], cuts[2 * pair + 1]
         statements = [text for thread, kind, text in rows[start + 1:end] if thread != reader and kind in ("Query", "Execute")]
-        counted = Counter(normalise(text) for text in statements)
+        counted = Counter(normalise(text.replace("\\n", " ")) for text in statements)
+        statements_of_page[page["name"]] = set(counted)
         lines.append(f"## {page['name']} ({len(statements)} statements logged, {page['steady']} counted)")
         lines.append("")
         lines.append("| Times | Statement |")
@@ -49,9 +51,29 @@ def main(log_file: str, campaign_file: str, output_file: str) -> None:
             lines.append(f"| {times} | `{statement[:400].replace('|', '/')}` |")
         lines.append("")
 
+    if slow_file:
+        # Slow log rows: seconds, rows examined, statement. Grouped by normalised statement, slowest first.
+        slow = {}
+        with open(slow_file, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.rstrip("\n").split("\t", 2)
+                if len(parts) != 3:
+                    continue
+                seconds, examined, text = float(parts[0]), int(parts[1]), parts[2].replace("\\n", " ")
+                key = normalise(text)
+                entry = slow.setdefault(key, {"times": 0, "seconds": 0.0, "examined": 0})
+                entry["times"] += 1
+                entry["seconds"] = max(entry["seconds"], seconds)
+                entry["examined"] = max(entry["examined"], examined)
+        head = ["# Slow statements", "", "| Slowest (s) | Rows examined | Times | Pages | Statement |", "|---:|---:|---:|---|---|"]
+        for key, entry in sorted(slow.items(), key=lambda item: -item[1]["seconds"])[:25]:
+            where = ", ".join(name for name, seen in statements_of_page.items() if key in seen) or "-"
+            head.append(f"| {entry['seconds']:.3f} | {entry['examined']} | {entry['times']} | {where} | `{key[:600].replace('|', '/')}` |")
+        lines = head + [""] + lines
+
     with open(output_file, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    main(*sys.argv[1:5])
