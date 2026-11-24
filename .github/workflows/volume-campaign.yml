@@ -1,0 +1,184 @@
+name: volume-campaign
+
+# Runs the volume protocol of setup/volume/README.md at several catalogue sizes, each on a fresh
+# demo install served as in production (APP_ENV=prod, Apache and PHP-FPM, MySQL 8 of the runner):
+# generation, two campaigns compared, then a third pass with the general log on, grouped by page.
+on:
+  push:
+    branches: [ 'volume-campaign/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    name: Volume ${{ matrix.size.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        size:
+          - { name: 1k, products: 1000, orders: 1000, customers: 500 }
+          - { name: 10k, products: 10000, orders: 10000, customers: 5000 }
+          - { name: 100k, products: 100000, orders: 100000, customers: 50000 }
+          - { name: 10k-200k-orders, products: 10000, orders: 200000, customers: 50000 }
+    env:
+      COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ github.token }}"}}'
+      COMPOSER_NO_INTERACTION: '1'
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: '3306'
+      DATABASE_USER: root
+      DATABASE_PASSWORD: root
+      DATABASE_NAME: thelia
+      ORIGIN: https://127.0.0.1:8443
+      RESULTS: ${{ github.workspace }}/var/volume
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Start MySQL
+        run: sudo systemctl start mysql.service
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.3'
+          ini-values: post_max_size=20M, memory_limit=-1
+          coverage: none
+          extensions: mbstring, xml, ctype, iconv, intl, pdo_sqlite, mysql, gd, zip
+
+      - name: Install Apache and PHP-FPM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q apache2 php8.3-fpm
+          sudo phpenmod -v 8.3 -s fpm mbstring xml ctype iconv intl pdo_sqlite mysqlnd pdo_mysql mysqli gd zip opcache || true
+          for extension in intl pdo_mysql gd mbstring; do
+            php-fpm8.3 -m | grep -qx "$extension" || { echo "::error::PHP-FPM lacks $extension"; exit 1; }
+          done
+
+      - name: Resolve the themes from their development branch
+        run: |
+          composer require --no-update --no-scripts --no-audit \
+            "thelia/flexy:dev-main as 1.99.0" \
+            "thelia/backoffice-default-twig-template:dev-main as 1.99.0" \
+            "thelia/email-default-template:dev-main as 1.99.0" \
+            "thelia/pdf-default-template:dev-main as 1.99.0"
+
+      - name: Install Composer dependencies
+        run: composer update --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Drop the files the official recipes write
+        run: rm -f src/Schedule.php config/packages/messenger.yaml
+
+      - name: Install the demo shop
+        run: >-
+          php bin/install
+          --frontoffice_theme=flexy --backoffice_theme=default-twig
+          --pdf_theme=default --email_theme=default
+          --with-demo --with-admin
+          --admin_login=thelia --admin_password=thelia
+          --admin_first_name=Admin --admin_last_name=User
+          --admin_email=admin@example.com
+
+      - name: Describe the machine
+        run: |
+          mkdir -p "$RESULTS"
+          {
+            echo "size: ${{ matrix.size.name }}"
+            echo "commit: $(git rev-parse --short=9 HEAD)"
+            echo "machine: $(nproc) vCPU $(lscpu | sed -n 's/^Model name: *//p'), $(free -g | awk '/^Mem:/ {print $2}') GB, $RUNNER_OS $RUNNER_ARCH GitHub-hosted runner"
+            echo "database: $(mysql -h127.0.0.1 -uroot -proot -N -e 'SELECT VERSION()' 2>/dev/null)"
+            echo "php: $(php -r 'echo PHP_VERSION;')"
+            echo "flexy: $(composer show thelia/flexy --format=json | php -r '$p = json_decode(stream_get_contents(STDIN), true); echo implode(" ", $p["versions"]), " ", substr($p["source"]["reference"] ?? "", 0, 9);')"
+            echo "demo: $(mysql -h127.0.0.1 -uroot -proot -N -e 'SELECT COUNT(*) FROM product' thelia 2>/dev/null) products, $(mysql -h127.0.0.1 -uroot -proot -N -e 'SELECT COUNT(*) FROM `order`' thelia 2>/dev/null) orders"
+          } | tee "$RESULTS/machine.txt"
+
+      - name: Generate the dataset
+        run: |
+          set -o pipefail
+          APP_ENV=dev php bin/console thelia:test:volume:generate \
+            --products=${{ matrix.size.products }} --orders=${{ matrix.size.orders }} --customers=${{ matrix.size.customers }} \
+            --force --no-ansi 2>&1 | tee "$RESULTS/generation.txt"
+
+      - name: Switch the shop to production and compile its assets
+        run: |
+          printf '\nAPP_ENV=prod\nAPP_DEBUG=0\n' >> .env.local
+          php bin/console cache:warmup --env=prod
+          php bin/console importmap:install --env=prod
+          php bin/console asset-map:compile --env=prod
+
+      - name: Serve the shop with Apache and PHP-FPM
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=127.0.0.1" \
+            -addext "subjectAltName=IP:127.0.0.1" \
+            -keyout "$RUNNER_TEMP/shop.key" -out "$RUNNER_TEMP/shop.crt" 2>/dev/null
+          sudo sed -i -e 's/^user = .*/user = runner/' -e 's/^group = .*/group = runner/' \
+            -e 's/^listen.owner = .*/listen.owner = runner/' -e 's/^listen.group = .*/listen.group = runner/' \
+            /etc/php/8.3/fpm/pool.d/www.conf
+          printf 'php_admin_value[memory_limit] = 1024M\nphp_admin_value[max_execution_time] = 600\nrequest_terminate_timeout = 600\n' | sudo tee -a /etc/php/8.3/fpm/pool.d/www.conf > /dev/null
+          sudo sed -i -e 's/^export APACHE_RUN_USER=.*/export APACHE_RUN_USER=runner/' \
+            -e 's/^export APACHE_RUN_GROUP=.*/export APACHE_RUN_GROUP=runner/' /etc/apache2/envvars
+          sudo tee /etc/apache2/sites-available/shop.conf > /dev/null <<APACHE
+          Listen 8443
+          Timeout 600
+          <VirtualHost 127.0.0.1:8443>
+              Protocols h2 http/1.1
+              SSLEngine on
+              SSLCertificateFile $RUNNER_TEMP/shop.crt
+              SSLCertificateKeyFile $RUNNER_TEMP/shop.key
+              DocumentRoot $GITHUB_WORKSPACE/public
+              DirectoryIndex index.php
+              <Directory $GITHUB_WORKSPACE/public>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              <FilesMatch "\.php$">
+                  SetHandler "proxy:unix:/run/php/php8.3-fpm.sock|fcgi://localhost"
+              </FilesMatch>
+              ProxyTimeout 600
+              ErrorLog $RUNNER_TEMP/apache-error.log
+          </VirtualHost>
+          APACHE
+          sudo a2dismod -q mpm_prefork || true
+          sudo a2enmod -q mpm_event ssl http2 rewrite headers expires deflate brotli setenvif proxy_fcgi
+          sudo a2ensite -q shop
+          sudo systemctl restart php8.3-fpm
+          sudo systemctl restart apache2
+          code=$(curl -sk -o /dev/null -w '%{http_code}' "$ORIGIN/")
+          [ "$code" = "200" ] || { echo "::error::the storefront answered $code"; sudo tail -n 50 "$RUNNER_TEMP/apache-error.log"; tail -n 50 var/log/*.log 2>/dev/null; exit 1; }
+          ! curl -sk -D - -o /dev/null "$ORIGIN/" | grep -qi '^x-debug-token' || { echo "::error::not in production"; exit 1; }
+
+      - name: Measure twice
+        run: |
+          set -o pipefail
+          mysql -h127.0.0.1 -uroot -proot -e "DELETE FROM form_firewall" thelia
+          php bin/console cache:pool:clear cache.rate_limiter --env=prod
+          php bin/console thelia:test:volume:measure --base-url="$ORIGIN" --runs=3 --output="$RESULTS/campaign-1.json" --no-ansi 2>&1 | tee "$RESULTS/campaign-1.txt"
+          mysql -h127.0.0.1 -uroot -proot -e "DELETE FROM form_firewall" thelia
+          php bin/console thelia:test:volume:measure --base-url="$ORIGIN" --runs=3 --skip-jobs --output="$RESULTS/campaign-2.json" --compare="$RESULTS/campaign-1.json" --no-ansi 2>&1 | tee "$RESULTS/campaign-2.txt"
+
+      - name: Profile the statements of each page
+        if: always()
+        run: |
+          mysql -h127.0.0.1 -uroot -proot -e "DELETE FROM form_firewall" thelia
+          mysql -h127.0.0.1 -uroot -proot -e "TRUNCATE mysql.general_log; SET GLOBAL log_output = 'TABLE'; SET GLOBAL general_log = 1;"
+          php bin/console thelia:test:volume:measure --base-url="$ORIGIN" --runs=1 --skip-jobs --output="$RESULTS/profile.json" --no-ansi > "$RESULTS/profile.txt" 2>&1 || true
+          mysql -h127.0.0.1 -uroot -proot -e "SET GLOBAL general_log = 0;"
+          mysql -h127.0.0.1 -uroot -proot -N -B -e "SELECT thread_id, command_type, CONVERT(argument USING utf8mb4) FROM mysql.general_log" > "$RUNNER_TEMP/general.tsv"
+          python3 .github/volume/profile.py "$RUNNER_TEMP/general.tsv" "$RESULTS/profile.json" "$RESULTS/statements.md"
+          cat "$RESULTS/statements.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the server logs
+        if: failure()
+        run: sudo tail -n 80 "$RUNNER_TEMP/apache-error.log" /var/log/php8.3-fpm.log var/log/*.log 2>/dev/null || true
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: volume-${{ matrix.size.name }}
+          path: var/volume/
+          if-no-files-found: warn
+          retention-days: 90
