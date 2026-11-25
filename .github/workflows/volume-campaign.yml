@@ -20,8 +20,11 @@ jobs:
       fail-fast: false
       matrix:
         size:
-          # Figures of the report: run 45423895830 (four sizes). This run profiles the two largest again.
+          - { name: 1k, products: 1000, orders: 1000, customers: 500 }
+          - { name: 10k, products: 10000, orders: 10000, customers: 5000 }
           - { name: 100k, products: 100000, orders: 100000, customers: 50000 }
+          # A second fresh install at the same size: do two installs write the same dataset?
+          - { name: 100k-bis, products: 100000, orders: 100000, customers: 50000 }
           - { name: 10k-200k-orders, products: 10000, orders: 200000, customers: 50000 }
     env:
       COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ github.token }}"}}'
@@ -93,6 +96,24 @@ jobs:
             echo "flexy: $(composer show thelia/flexy --format=json | php -r '$p = json_decode(stream_get_contents(STDIN), true); echo implode(" ", $p["versions"]), " ", substr($p["source"]["reference"] ?? "", 0, 9);')"
             echo "demo: $(mysql -h127.0.0.1 -uroot -proot -N -e 'SELECT COUNT(*) FROM product' thelia 2>/dev/null) products, $(mysql -h127.0.0.1 -uroot -proot -N -e 'SELECT COUNT(*) FROM `order`' thelia 2>/dev/null) orders"
           } | tee "$RESULTS/machine.txt"
+
+      - name: Note what the dataset takes from the shop
+        # The generator reuses identifiers of the shop (modules, statuses, tax rule, country...):
+        # two installs that give other identifiers write other rows.
+        run: |
+          q() { echo "== $1"; mysql -h127.0.0.1 -uroot -proot -N -B -e "$1" thelia; }
+          {
+            q "SELECT id, code, type, activate, position FROM module ORDER BY id"
+            q "SELECT id, code FROM order_status ORDER BY id"
+            q "SELECT id, is_default FROM tax_rule ORDER BY id"
+            q "SELECT id FROM country WHERE by_default = 1"
+            q "SELECT id, is_default FROM customer_group ORDER BY id"
+            q "SELECT id FROM customer_title ORDER BY id"
+            q "SELECT id, locale FROM lang ORDER BY id"
+            q "SELECT id, code, by_default FROM currency ORDER BY id"
+            q "SELECT 'product', MAX(id) FROM product UNION ALL SELECT 'category', MAX(id) FROM category UNION ALL SELECT 'customer', MAX(id) FROM customer UNION ALL SELECT 'order', MAX(id) FROM \`order\` UNION ALL SELECT 'rewriting_url', MAX(id) FROM rewriting_url"
+          } > "$RESULTS/references.txt" 2>&1
+          cat "$RESULTS/references.txt"
 
       - name: Generate the dataset
         run: |
@@ -169,6 +190,17 @@ jobs:
           mysql -h127.0.0.1 -uroot -proot -N -B -e "SELECT thread_id, command_type, CONVERT(argument USING utf8mb4) FROM mysql.general_log" > "$RUNNER_TEMP/general.tsv"
           python3 .github/volume/profile.py "$RUNNER_TEMP/general.tsv" "$RESULTS/profile.json" "$RESULTS/statements.md" "$RUNNER_TEMP/slow.tsv"
           cat "$RESULTS/statements.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Walk the shop
+        if: always()
+        run: |
+          mysql -h127.0.0.1 -uroot -proot -e "DELETE FROM form_firewall" thelia
+          php bin/console cache:pool:clear cache.rate_limiter --env=prod
+          mkdir -p "$RUNNER_TEMP/walk"
+          cp .github/volume/walk.mjs "$RUNNER_TEMP/walk/"
+          npm install --prefix "$RUNNER_TEMP/walk" --no-audit --no-fund playwright@1.59.1
+          (cd "$RUNNER_TEMP/walk" && npx playwright install --with-deps chromium)
+          node "$RUNNER_TEMP/walk/walk.mjs" "$ORIGIN" "$RESULTS/campaign-1.json" "$RESULTS/walk"
 
       - name: Show the server logs
         if: failure()
